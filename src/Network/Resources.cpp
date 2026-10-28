@@ -41,6 +41,104 @@
 
 namespace fs = std::filesystem;
 
+// Remembers sha256 hashes of cached mods keyed by size + last write time, so
+// unchanged files aren't re-read in full on every join. Only used for files
+// already in the cache; fresh downloads are always hashed from their bytes.
+static nlohmann::json HashCache;
+static bool HashCacheLoaded = false;
+
+static fs::path HashCachePath() {
+    return fs::path(GetEP()) / "hash_cache.json";
+}
+
+static void LoadHashCache() {
+    if (HashCacheLoaded)
+        return;
+    HashCacheLoaded = true;
+    try {
+        std::ifstream In(HashCachePath());
+        if (In)
+            HashCache = nlohmann::json::parse(In);
+    } catch (const std::exception&) {
+    }
+    if (!HashCache.is_object())
+        HashCache = nlohmann::json::object();
+}
+
+static bool GetFileStamp(const fs::path& File, uintmax_t& Size, long long& Time) {
+    std::error_code ec;
+    Size = fs::file_size(File, ec);
+    if (ec)
+        return false;
+    Time = static_cast<long long>(fs::last_write_time(File, ec).time_since_epoch().count());
+    return !ec;
+}
+
+static void RememberSha256(const fs::path& File, const std::string& Hash) {
+    uintmax_t Size;
+    long long Time;
+    if (!GetFileStamp(File, Size, Time))
+        return;
+    LoadHashCache();
+    HashCache[File.filename().string()] = { { "size", Size }, { "time", Time }, { "hash", Hash } };
+    // write to a temp file first so an interrupted write can't leave a truncated cache
+    const fs::path Tmp = fs::path(HashCachePath()) += ".tmp";
+    try {
+        {
+            std::ofstream Out(Tmp, std::ios::trunc);
+            Out << HashCache.dump();
+            if (!Out)
+                return;
+        }
+        std::error_code ec;
+        fs::rename(Tmp, HashCachePath(), ec);
+    } catch (const std::exception&) {
+    }
+}
+
+static std::string CachedSha256(const fs::path& File) {
+    uintmax_t Size;
+    long long Time;
+    if (!GetFileStamp(File, Size, Time))
+        return Utils::GetSha256HashReallyFastFile(File);
+    LoadHashCache();
+    auto It = HashCache.find(File.filename().string());
+    if (It != HashCache.end() && It->is_object()) {
+        const auto SizeIt = It->find("size");
+        const auto TimeIt = It->find("time");
+        const auto HashIt = It->find("hash");
+        if (SizeIt != It->end() && SizeIt->is_number_unsigned() && SizeIt->get<uintmax_t>() == Size
+            && TimeIt != It->end() && TimeIt->is_number_integer() && TimeIt->get<long long>() == Time
+            && HashIt != It->end() && HashIt->is_string()) {
+            return HashIt->get<std::string>();
+        }
+    }
+    std::string Hash = Utils::GetSha256HashReallyFastFile(File);
+    RememberSha256(File, Hash);
+    return Hash;
+}
+
+// Puts a cached mod into mods/multiplayer. Hardlinks it when the cache and the
+// game folder are on the same volume, otherwise falls back to a full copy. Goes
+// through a .tmp name + rename so the game never sees a partial file.
+static void PlaceModFile(const fs::path& Source, const fs::path& Target) {
+    std::error_code ec;
+    if (fs::exists(Target, ec) && fs::equivalent(Source, Target, ec))
+        return; // already linked to this cache file
+    fs::path Tmp = Target;
+    Tmp += ".tmp";
+    ec.clear();
+    fs::remove(Tmp, ec);
+    if (ec)
+        throw std::runtime_error("Couldn't remove leftover temp file " + Tmp.string() + ": " + ec.message());
+    fs::create_hard_link(Source, Tmp, ec);
+    if (ec) {
+        debug("Hardlink failed (" + ec.message() + "), copying instead");
+        fs::copy_file(Source, Tmp, fs::copy_options::overwrite_existing);
+    }
+    fs::rename(Tmp, Target);
+}
+
 void CheckForDir() {
     if (!fs::exists(CachingDirectory)) {
         try {
@@ -456,10 +554,9 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
         }
         auto FileName = std::filesystem::path(ModInfoIter->FileName).stem().string() + "-" + ModInfoIter->Hash.substr(0, 8) + std::filesystem::path(ModInfoIter->FileName).extension().string();
         auto PathToSaveTo = (CachingDirectory / FileName);
-        if (fs::exists(PathToSaveTo) && Utils::GetSha256HashReallyFastFile(PathToSaveTo) == ModInfoIter->Hash) {
+        if (fs::exists(PathToSaveTo) && CachedSha256(PathToSaveTo) == ModInfoIter->Hash) {
             debug("Mod '" + FileName + "' found in cache");
             UpdateUl(false, std::to_string(ModNo) + "/" + std::to_string(TotalMods) + ": " + ModInfoIter->FileName);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             try {
                 if (!fs::exists(GetGamePath() / beammp_wide("mods/multiplayer"))) {
                     fs::create_directories(GetGamePath() / beammp_wide("mods/multiplayer"));
@@ -473,11 +570,7 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
 #endif
                 debug("Mod name: " + modname);
                 auto name = std::filesystem::path(GetGamePath()) / "mods/multiplayer" / modname;
-                std::string tmp_name = name.string();
-                tmp_name += ".tmp";
-
-                fs::copy_file(PathToSaveTo, tmp_name, fs::copy_options::overwrite_existing);
-                fs::rename(tmp_name, name);
+                PlaceModFile(PathToSaveTo, name);
                 UpdateModUsage(FileName);
             } catch (std::exception& e) {
                 error("Failed copy to the mods folder! " + std::string(e.what()));
@@ -487,10 +580,9 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
             WaitForConfirm();
             continue;
         } else if (auto OldCachedPath = CachingDirectory / std::filesystem::path(ModInfoIter->FileName).filename();
-                   fs::exists(OldCachedPath) && Utils::GetSha256HashReallyFastFile(OldCachedPath) == ModInfoIter->Hash) {
+                   fs::exists(OldCachedPath) && CachedSha256(OldCachedPath) == ModInfoIter->Hash) {
             debug("Mod '" + FileName + "' found in old cache, copying it to the new cache");
             UpdateUl(false, std::to_string(ModNo) + "/" + std::to_string(TotalMods) + ": " + ModInfoIter->FileName);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             try {
                 fs::copy_file(OldCachedPath, PathToSaveTo, fs::copy_options::overwrite_existing);
 
@@ -509,11 +601,7 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
 
                 debug("Mod name: " + modname);
                 auto name = std::filesystem::path(GetGamePath()) / "mods/multiplayer" / modname;
-                std::string tmp_name = name.string();
-                tmp_name += ".tmp";
-
-                fs::copy_file(PathToSaveTo, tmp_name, fs::copy_options::overwrite_existing);
-                fs::rename(tmp_name, name);
+                PlaceModFile(PathToSaveTo, name);
                 UpdateModUsage(FileName);
             } catch (std::exception& e) {
                 error("Failed copy to the mods folder! " + std::string(e.what()));
@@ -563,6 +651,8 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
 
             // 1. write downloaded file to disk
             {
+                std::error_code RemoveEc;
+                fs::remove(PathToSaveTo, RemoveEc); // break any hardlink before rewriting
                 std::ofstream OutFile(PathToSaveTo, std::ios::binary | std::ios::trunc);
                 OutFile.write(DownloadedFile.data(), DownloadedFile.size());
                 OutFile.flush();
@@ -573,9 +663,11 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
                 Terminate = true;
             }
 
-            if (Utils::GetSha256HashReallyFastFile(PathToSaveTo) != ModInfoIter->Hash) {
+            if (const auto DownloadedHash = Utils::GetSha256HashReallyFastFile(PathToSaveTo); DownloadedHash != ModInfoIter->Hash) {
                 error(beammp_wide("Failed to write or download the entire file '") + beammp_fs_string(PathToSaveTo) + beammp_wide("' correctly (hash mismatch)"));
                 Terminate = true;
+            } else {
+                RememberSha256(PathToSaveTo, DownloadedHash);
             }
         } while (fs::file_size(PathToSaveTo) != ModInfoIter->FileSize && !Terminate);
         if (!Terminate) {
@@ -590,16 +682,12 @@ void NewSyncResources(SOCKET Sock, const std::string& Mods, const std::vector<Mo
             }
 #endif
             auto name = std::filesystem::path(GetGamePath()) / "mods/multiplayer" / FName;
-            auto tmp_name = name;
-            tmp_name += ".tmp";
-
-            std::error_code ec;
-            fs::copy_file(PathToSaveTo, tmp_name, fs::copy_options::overwrite_existing, ec);
-            if (ec) {
-                error(beammp_wide("Error in copy_file during download of ") + beammp_fs_string(PathToSaveTo) + beammp_wide(": ") + Utils::ToWString(ec.message()));
+            try {
+                PlaceModFile(PathToSaveTo, name);
+            } catch (const std::exception& e) {
+                error(beammp_wide("Error placing mod after download of ") + beammp_fs_string(PathToSaveTo) + beammp_wide(": ") + Utils::ToWString(std::string(e.what())));
                 break;
             }
-            fs::rename(tmp_name, name);
             UpdateModUsage(FName);
         }
         WaitForConfirm();
@@ -705,10 +793,7 @@ void SyncResources(SOCKET Sock) {
                     }
 #endif
                     auto name = GetGamePath() / beammp_wide("mods/multiplayer") / Utils::ToWString(modname);
-                    auto tmp_name = name;
-                    tmp_name += L".tmp";
-                    fs::copy_file(PathToSaveTo, tmp_name, fs::copy_options::overwrite_existing);
-                    fs::rename(tmp_name, name);
+                    PlaceModFile(PathToSaveTo, name);
                     UpdateModUsage(modname);
                 } catch (std::exception& e) {
                     error("Failed copy to the mods folder! " + std::string(e.what()));
@@ -743,6 +828,8 @@ void SyncResources(SOCKET Sock) {
 
             // 1. write downloaded file to disk
             {
+                std::error_code RemoveEc;
+                fs::remove(PathToSaveTo, RemoveEc); // break any hardlink before rewriting
                 std::ofstream OutFile(PathToSaveTo, std::ios::binary | std::ios::trunc);
                 OutFile.write(DownloadedFile.data(), DownloadedFile.size());
             }
@@ -765,11 +852,7 @@ void SyncResources(SOCKET Sock) {
 #endif
 
             auto name = GetGamePath() / beammp_wide("mods/multiplayer") / Utils::ToWString(FName);
-            auto tmp_name = name;
-            tmp_name += L".tmp";
-
-            fs::copy_file(PathToSaveTo, tmp_name, fs::copy_options::overwrite_existing);
-            fs::rename(tmp_name, name);
+            PlaceModFile(PathToSaveTo, name);
             UpdateModUsage(FN->substr(pos));
         }
         WaitForConfirm();
